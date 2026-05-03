@@ -169,30 +169,49 @@ void uninstalled() {
 
 void initialize() {
     if (logEnable) log.debug "initialize()"
+    state.retryS = 5
     log.info "Starting log export to syslog"
     runIn(10, "connect")
 
 }
 
 void webSocketStatus(String message) {
-    // handle error messages and reconnect
     if (logEnable) log.debug "Got status ${message}"
-    // Reconnect on any status that isn't "status: open" — covers both
-    // explicit "failure: ..." and silent close ("status: closed", etc).
+    // Lifecycle:
+    //   "status: open"      — connected
+    //   "status: closing"   — transient (fires for the old socket each time
+    //                         we call connect(); usually followed by
+    //                         "status: open" for the new socket within ~30ms).
+    //                         Treating this as a disconnect creates a
+    //                         reconnect loop.
+    //   "status: closed"    — terminal
+    //   "failure: <reason>" — error
+    //
     // Hubitat's runIn wants the method name as a string, not a method
     // reference (the previous `runIn(5, connect)` form silently no-op'd
     // on some firmware revisions).
     //
-    // Surface up/down transitions at info/warn so an operator can see
-    // them without enabling debug — drops are infrequent but matter.
-    // Note: this is the LOCAL websocket to Hubitat's logsocket (always
-    // WS regardless of UDP/TCP outbound choice), not the syslog
-    // destination — UDP/TCP sends are fire-and-forget per message.
+    // This is the LOCAL websocket to Hubitat's logsocket (always WS
+    // regardless of UDP/TCP outbound choice), not the syslog destination —
+    // UDP/TCP sends are fire-and-forget per message.
     if (message?.startsWith("status: open")) {
+        // Cancel any pending reconnect/watchdog and reset backoff.
+        unschedule("connect")
+        state.retryS = 5
         log.info "logsocket websocket connected — forwarding to ${udptcp} ${ip}:${port}"
+    } else if (message?.startsWith("status: closing")) {
+        // Transient. Arm a 10s watchdog — if no "open" arrives by then,
+        // the connection didn't come back and we should retry.
+        if (logEnable) log.debug "websocket closing (transient); arming 10s watchdog"
+        runIn(10, "connect")
     } else {
-        log.warn "logsocket websocket lost (${message}); reconnecting in 5s"
-        runIn(5, "connect")
+        // status: closed, failure: *, anything else → reconnect with
+        // exponential backoff (5s → 10s → 20s → 40s → 60s capped).
+        // Reset to 5s on a successful "status: open".
+        def delayS = (state.retryS ?: 5) as Integer
+        log.warn "logsocket websocket lost (${message}); reconnecting in ${delayS}s"
+        runIn(delayS, "connect")
+        state.retryS = Math.min(delayS * 2, 60)
     }
 }
 
