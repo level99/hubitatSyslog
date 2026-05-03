@@ -80,54 +80,62 @@ void updated() {
 }
 
 void parse(String description) {
-    
-    def hub = location.hubs[0]
-    // If I can't get a hostname, an IP address will do.
-    if (!hostname?.trim()) {
-      hostname = hub.getDataValue("localIP")
-    }
-    
+
     def descData = new JsonSlurper().parseText(description)
-    logLevel = descData.level != null ? descData.level : "info"
+
+    // don't log our own messages, we will get into a loop
+    if (descData.type == "dev" && "${descData.id}" == "${device.id}") {
+        return
+    }
+
+    if (ip == null) {
+        log.warn "No log server set"
+        return
+    }
+
+    // Use a local variable for the effective hostname — `hostname` is a
+    // preference (read-only at runtime). Fall back to the hub's local IP
+    // if the preference is empty.
+    def hub = location.hubs[0]
+    def effectiveHostname = hostname?.trim() ?: hub.getDataValue("localIP")
+
+    // Use a LOCAL `logLevel` (don't leak into script binding).
+    def logLevel = descData.level != null ? descData.level : "info"
 
     // rfc5424 syslog protocol version
     def syslogVersion = 1
 
-    // don't log our own messages, we will get into a loop
-    if(!(descData.type == "dev" && "${descData.id}" == "${device.id}")) {
-        if(ip != null) {
-            // facility = 1 (user), severity = 6 (informational)
-            // facility * 8 + severity = 14
-            // see  also getFacilityMap() and getPriorityMap() below ...
-            def priority = getFacilityMap()[logFacility] + getPriorityMap()[logLevel]}
-            
-            // we get date-space-time but would like ISO8601
-            if (logEnable) log.debug "timezone from hub is ${location.timeZone.toString()}"
-            def dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
-            def date = Date.parse(dateFormat, descData.time)
-            
-            // location timeZone comes from the geolocation of the hub. It's possible it's not set?
-            def isoDate = date.format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", location.timeZone)
-            if (logEnable) log.debug "time we get = ${descData.time}; time we want ${isoDate}"
-            
-            // jtp10181
-            def message = escapeStringHTMLforMsg(descData.msg)
+    // facility * 8 + severity = priority. Defensive defaults: local0 (16<<3=128)
+    // for unknown facility, info (6) for unknown level — covers Hubitat
+    // platform levels not in our static map (e.g. "verbose", "system").
+    def facility = getFacilityMap()[logFacility] ?: getFacilityMap()["local0"]
+    def severity = getPriorityMap()[logLevel] ?: 6
+    def priority = facility + severity
 
-            // made up PROCID or MSGID //TODO find PROCID and MSGID in the API?
-            def constructedString = "<${priority}>${syslogVersion} ${isoDate} ${hostname} " + descData.type + " " + descData.id.toString() + " - - ${message}"
-            if (logEnable) log.debug "sending: ${constructedString} to ${udptcp}:${ip}:${port}"
-            
-            if (udptcp == 'UDP') {
-              if (logEnable) log.debug "UDP selected"
-              sendHubCommand(new HubAction(constructedString, Protocol.LAN, [destinationAddress: "${ip}:${port}", type: HubAction.Type.LAN_TYPE_UDPCLIENT, ignoreResponse:true]))
-            } else {
-              if (logEnable) log.debug "TCP selected"
-              sendHubCommand(new HubAction(constructedString, Protocol.RAW_LAN, [destinationAddress: "${ip}:${port}", type: HubAction.Type.LAN_TYPE_RAW]))
-            }
+    // we get date-space-time but would like ISO8601
+    if (logEnable) log.debug "timezone from hub is ${location.timeZone?.toString()}"
+    def dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+    def date = Date.parse(dateFormat, descData.time)
 
-        } else {
-            log.warn "No log server set"
-        }
+    // location timeZone comes from the geolocation of the hub. It's possible it's not set?
+    // Date.format with null timeZone falls back to JVM default — acceptable.
+    def isoDate = date.format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", location.timeZone)
+    if (logEnable) log.debug "time we get = ${descData.time}; time we want ${isoDate}"
+
+    // jtp10181
+    def message = escapeStringHTMLforMsg(descData.msg)
+
+    // RFC5424 frame: <PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
+    // PROCID, MSGID, STRUCTURED-DATA all set to NILVALUE ("-") since we don't have them.
+    def constructedString = "<${priority}>${syslogVersion} ${isoDate} ${effectiveHostname} " + descData.type + " " + descData.id.toString() + " - - - ${message}"
+    if (logEnable) log.debug "sending: ${constructedString} to ${udptcp}:${ip}:${port}"
+
+    if (udptcp == 'UDP') {
+        if (logEnable) log.debug "UDP selected"
+        sendHubCommand(new HubAction(constructedString, Protocol.LAN, [destinationAddress: "${ip}:${port}", type: HubAction.Type.LAN_TYPE_UDPCLIENT, ignoreResponse:true]))
+    } else {
+        if (logEnable) log.debug "TCP selected"
+        sendHubCommand(new HubAction(constructedString, Protocol.RAW_LAN, [destinationAddress: "${ip}:${port}", type: HubAction.Type.LAN_TYPE_RAW]))
     }
 }
 
@@ -137,8 +145,8 @@ void connect() {
         interfaces.webSocket.connect("http://localhost:8080/logsocket")
         pauseExecution(1000)
     } catch(e) {
-        log.error "initialize error: ${e.message}"
-        logger.error("Exception", e)
+        // `logger` doesn't exist in the Hubitat driver context — use log.
+        log.error "connect() error: ${e.message}"
     }
 }
 
@@ -158,11 +166,15 @@ void initialize() {
 }
 
 void webSocketStatus(String message) {
-	// handle error messages and reconnect
-    if (logEnable) log.debug "Got status ${message}" 
-    if(message.startsWith("failure")) {
-        // reconnect in a little bit
-        runIn(5, connect)
+    // handle error messages and reconnect
+    if (logEnable) log.debug "Got status ${message}"
+    // Reconnect on any status that isn't "status: open" — covers both
+    // explicit "failure: ..." and silent close ("status: closed", etc).
+    // Hubitat's runIn wants the method name as a string, not a method
+    // reference (the previous `runIn(5, connect)` form silently no-op'd
+    // on some firmware revisions).
+    if (!message?.startsWith("status: open")) {
+        runIn(5, "connect")
     }
 }
 
