@@ -54,6 +54,7 @@ metadata {
         input("udptcp", "enum", title: "UDP or TCP?", description: "", defaultValue: "UDP", options: ["UDP","TCP"])
         input("logFacility", "enum", title: "Log Facility", description: "", defaultValue: "local0", options: ["kern","user","mail","daemon","auth","syslog","lpr","news","uucp","cron","authpriv","ftp","ntp","security","console","local0","local1","local2","local3","local4","local5","local6","local7"])
         input("hostname", "text", title: "Hub Hostname", description: "hostname of the hub; leave empty for IP address", defaultValue: location.hub["name"])
+        input("localBackoffMaxMin", "number", title: "Local logsocket reconnect backoff cap (minutes)", description: "Max time between reconnect attempts to the LOCAL Hubitat logsocket (the websocket that feeds this driver hub log events). Lower = faster recovery, more log noise during sustained outages. Higher = quieter logs, longer worst-case downtime. Schedule doubles per attempt up to this cap (1, 2, 4, 8, ... capped). Range 1-60, default 10. Note: this does NOT affect the outbound syslog destination — UDP/TCP sends to the configured Syslog IP are fire-and-forget per message, no connection retry applies.", defaultValue: 10, range: "1..60")
         input("logEnable", "bool", title: "Enable debug logging", description: "", defaultValue: false)
     }
 }
@@ -160,6 +161,7 @@ void connect() {
 }
 
 void disconnect() {
+    state.connected = false
     interfaces.webSocket.close()
 }
 
@@ -169,49 +171,120 @@ void uninstalled() {
 
 void initialize() {
     if (logEnable) log.debug "initialize()"
-    state.retryS = 5
+    state.connected = false
+    state.failures = 0
+    state.nextAttempt = 0
     log.info "Starting log export to syslog"
+    // Clear any prior runIn/schedule from a previous instance — defensive,
+    // since unschedule(String) doesn't reliably match runIn(N, String) jobs
+    // on current firmware (see Refs below).
+    unschedule()
     runIn(10, "connect")
+    // Periodic health check drives recovery from any disconnected state.
+    // See "Reconnect strategy" comment block on webSocketStatus() below for
+    // why reconnect logic must live here, NOT inside the status handler.
+    runEvery1Minute("healthCheck")
+}
 
+// Periodic recovery driver for the LOCAL logsocket websocket.
+// Runs every minute regardless of connection state. When healthy: resets
+// backoff counters and exits. When down: applies exponential backoff up
+// to the user-configured cap (preference localBackoffMaxMin, default
+// 10 min) before each retry. Schedule per attempt: 1m, 2m, 4m, 8m, 16m,
+// 32m, ... capped. Lower bound on the cap is 1 min (= no backoff
+// effectively, attempts every healthCheck tick).
+//
+// Note: this only governs the LOCAL websocket (driver ← Hubitat
+// logsocket). Outbound syslog sends to the user-configured destination
+// (UDP or TCP per `udptcp`) are fire-and-forget per message — there is
+// no outbound connection state to retry. A future enhancement could add
+// a separate `remoteBackoffMaxMin` for an outbound TCP-keepalive mode.
+void healthCheck() {
+    if (state.connected == true) {
+        // Healthy — reset backoff state.
+        state.failures = 0
+        state.nextAttempt = 0
+        if (logEnable) log.debug "healthCheck: connected"
+        return
+    }
+    if (now() < (state.nextAttempt ?: 0)) {
+        // Backoff window in effect; skip this tick silently.
+        if (logEnable) log.debug "healthCheck: in backoff window (next attempt at ${new Date((state.nextAttempt ?: 0) as Long)}), skipping"
+        return
+    }
+    state.failures = (state.failures ?: 0) + 1
+    def maxMin = (localBackoffMaxMin ?: 10) as Integer
+    def attempt = state.failures as Integer
+    // Exponential doubling: 1, 2, 4, 8, 16, 32, ... capped at maxMin.
+    // Cap the shift count to avoid Integer overflow on long stuck periods.
+    def shifted = (attempt > 30) ? Integer.MAX_VALUE : (1 << (attempt - 1))
+    def backoffMin = Math.min(shifted, maxMin) as Integer
+    state.nextAttempt = now() + (backoffMin * 60000L)
+    log.warn "healthCheck: not connected (failure #${attempt}); reconnecting, next attempt in ${backoffMin}m if this also fails"
+    connect()
 }
 
 void webSocketStatus(String message) {
     if (logEnable) log.debug "Got status ${message}"
-    // Lifecycle:
-    //   "status: open"      — connected
-    //   "status: closing"   — transient (fires for the old socket each time
-    //                         we call connect(); usually followed by
-    //                         "status: open" for the new socket within ~30ms).
-    //                         Treating this as a disconnect creates a
-    //                         reconnect loop.
-    //   "status: closed"    — terminal
-    //   "failure: <reason>" — error
+    // ────────────────────────── Reconnect strategy ──────────────────────────
+    // This handler ONLY updates state.connected. It does NOT schedule any
+    // reconnect calls. Recovery is driven entirely by the periodic
+    // healthCheck() above. Why:
     //
-    // Hubitat's runIn wants the method name as a string, not a method
-    // reference (the previous `runIn(5, connect)` form silently no-op'd
-    // on some firmware revisions).
+    //   1. Hubitat's webSocket lifecycle emits "status: closing" any time
+    //      connect() is called on an already-open socket — the platform
+    //      implicitly tears down the old socket BEFORE opening the new one,
+    //      and the closing event for the old socket fires ~30ms before the
+    //      open event for the new socket. If the status handler treats
+    //      "closing" as a disconnect signal and schedules a reconnect, the
+    //      result is an infinite connect → closing → reconnect loop. This
+    //      was empirically observed on firmware 2.5.0.126 (C-8) — every
+    //      connect cycle produced a "closing" event whether or not a real
+    //      disconnect had occurred.
     //
-    // This is the LOCAL websocket to Hubitat's logsocket (always WS
-    // regardless of UDP/TCP outbound choice), not the syslog destination —
-    // UDP/TCP sends are fire-and-forget per message.
+    //   2. unschedule(String) on current firmware does NOT reliably cancel
+    //      runIn(N, String) jobs. So a "cancel the watchdog when open
+    //      arrives" approach doesn't work either.
+    //
+    //   3. The Hubitat docs themselves do not enumerate the status messages
+    //      emitted by webSocketStatus — only that disconnections and errors
+    //      will be reported. So any status-event-based recovery scheme is
+    //      empirical and brittle.
+    //
+    //   4. The community-recommended pattern (multiple drivers including
+    //      the Logitech Harmony driver and the Log Watchdog driver) is to
+    //      pull reconnect logic OUT of webSocketStatus and put it in a
+    //      periodic ping/health routine. This avoids the loop by
+    //      construction.
+    //
+    // Refs:
+    //   - https://docs2.hubitat.com/en/developer/interfaces/websocket-interface
+    //   - https://community.hubitat.com/t/anyway-to-know-if-a-websocket-is-closed/44516
+    //   - https://community.hubitat.com/t/unschedule-doesn-t-always-work/75532
+    //
+    // Status messages we observe (NOT exhaustively documented by Hubitat):
+    //   "status: open"       — connected
+    //   "status: closing"    — transient when we just called connect();
+    //                          can also appear on a real graceful close.
+    //                          Treated identically here — set state and let
+    //                          healthCheck recover if needed.
+    //   "status: closed"     — terminal
+    //   "failure: <reason>"  — error
+    //
+    // Note: this is the LOCAL websocket to Hubitat's logsocket
+    // (http://localhost:8080/logsocket), NOT the syslog destination. UDP
+    // and TCP outbound sends are fire-and-forget per message; there is no
+    // outbound "connection" to manage.
     if (message?.startsWith("status: open")) {
-        // Cancel any pending reconnect/watchdog and reset backoff.
-        unschedule("connect")
-        state.retryS = 5
+        state.connected = true
         log.info "logsocket websocket connected — forwarding to ${udptcp} ${ip}:${port}"
     } else if (message?.startsWith("status: closing")) {
-        // Transient. Arm a 10s watchdog — if no "open" arrives by then,
-        // the connection didn't come back and we should retry.
-        if (logEnable) log.debug "websocket closing (transient); arming 10s watchdog"
-        runIn(10, "connect")
+        if (logEnable) log.debug "Got status: closing (deferred to healthCheck)"
+        state.connected = false
     } else {
-        // status: closed, failure: *, anything else → reconnect with
-        // exponential backoff (5s → 10s → 20s → 40s → 60s capped).
-        // Reset to 5s on a successful "status: open".
-        def delayS = (state.retryS ?: 5) as Integer
-        log.warn "logsocket websocket lost (${message}); reconnecting in ${delayS}s"
-        runIn(delayS, "connect")
-        state.retryS = Math.min(delayS * 2, 60)
+        // status: closed, failure: *, anything else
+        log.warn "logsocket websocket lost (${message})"
+        state.connected = false
     }
 }
 
