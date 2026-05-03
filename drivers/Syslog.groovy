@@ -81,7 +81,16 @@ void updated() {
 
 void parse(String description) {
 
-    def descData = new JsonSlurper().parseText(description)
+    def descData
+    try {
+        descData = new JsonSlurper().parseText(description)
+    } catch (e) {
+        // Malformed logsocket frame would otherwise crash parse() into
+        // Hubitat's generic crash log with no context for which message
+        // tripped it. Surface here and drop the frame.
+        log.error "parse() failed to decode logsocket frame: ${e.message}; raw=${description}"
+        return
+    }
 
     // don't log our own messages, we will get into a loop
     if (descData.type == "dev" && "${descData.id}" == "${device.id}") {
@@ -173,7 +182,16 @@ void webSocketStatus(String message) {
     // Hubitat's runIn wants the method name as a string, not a method
     // reference (the previous `runIn(5, connect)` form silently no-op'd
     // on some firmware revisions).
-    if (!message?.startsWith("status: open")) {
+    //
+    // Surface up/down transitions at info/warn so an operator can see
+    // them without enabling debug — drops are infrequent but matter.
+    // Note: this is the LOCAL websocket to Hubitat's logsocket (always
+    // WS regardless of UDP/TCP outbound choice), not the syslog
+    // destination — UDP/TCP sends are fire-and-forget per message.
+    if (message?.startsWith("status: open")) {
+        log.info "logsocket websocket connected — forwarding to ${udptcp} ${ip}:${port}"
+    } else {
+        log.warn "logsocket websocket lost (${message}); reconnecting in 5s"
         runIn(5, "connect")
     }
 }
