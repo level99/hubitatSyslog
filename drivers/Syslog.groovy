@@ -40,6 +40,15 @@
   - loop avoidance checks that the incoming message wasn't from a
     "dev" in addition to checking that its id number doesn't match our own
 
+2026-06-18
+  - Fix reconnect loop: webSocketStatus() treated "status: closing" as a
+    disconnect and set state.connected=false. On every healthCheck reconnect
+    the platform tears down the prior socket and emits "closing" AFTER the new
+    socket's "open", so that false clobbered the just-set true -- wedging
+    state.connected permanently false and reconnecting every backoff window
+    forever (logsocket flap, no logs forwarded). "closing" is now ignored; only
+    a real "closed"/"failure" marks disconnected.
+
 */
 
 metadata {
@@ -264,10 +273,11 @@ void webSocketStatus(String message) {
     //
     // Status messages we observe (NOT exhaustively documented by Hubitat):
     //   "status: open"       — connected
-    //   "status: closing"    — transient when we just called connect();
-    //                          can also appear on a real graceful close.
-    //                          Treated identically here — set state and let
-    //                          healthCheck recover if needed.
+    //   "status: closing"    — transient when we just called connect() on an
+    //                          already-open socket (platform swaps sockets).
+    //                          IGNORED here: acting on it clobbers the new
+    //                          socket's "open" and wedges connected=false. A
+    //                          real close is reported separately as "closed".
     //   "status: closed"     — terminal
     //   "failure: <reason>"  — error
     //
@@ -279,8 +289,14 @@ void webSocketStatus(String message) {
         state.connected = true
         log.info "logsocket websocket connected — forwarding to ${udptcp} ${ip}:${port}"
     } else if (message?.startsWith("status: closing")) {
-        if (logEnable) log.debug "Got status: closing (deferred to healthCheck)"
-        state.connected = false
+        // Transient — the platform emits "closing" while swapping sockets on a
+        // reconnect (it tears down the old socket just before the new one's
+        // "open"). Acting on it would clobber the connected=true that the new
+        // socket's "open" just set, wedging state.connected permanently false
+        // and re-triggering connect() on every healthCheck (the reconnect loop
+        // this rewrite was meant to kill). A genuine drop always arrives as
+        // "closed" / "failure: *" (handled below), so ignore "closing" here.
+        if (logEnable) log.debug "Got status: closing (ignored — not a disconnect)"
     } else {
         // status: closed, failure: *, anything else
         log.warn "logsocket websocket lost (${message})"
